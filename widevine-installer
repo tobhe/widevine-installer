@@ -1,61 +1,243 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
+#
+# widevine-installer (Asahi / ARM64)
+#
+# Single source of truth: $INSTALL_BASE (default /var/lib/widevine), holding one
+# fixed-up CDM. Every browser family is then wired to it:
+#
+#   native Firefox        -> MOZ_GMP_PATH + system default pref  (system-wide)
+#   native Chromium fam   -> per-profile symlink + component hint (Brave/Chrome/...)
+#   snap Firefox          -> per-profile copy + user.js          (confinement)
+#   snap Chromium         -> per-profile copy + component hint    (confinement)
+#
+# Snaps are strictly confined and cannot read /var/lib, so they get real copies;
+# everything else gets symlinks so a single CDM upgrade propagates instantly.
+#
+# Usage:
+#   sudo widevine-installer        download + install system CDM, then wire the
+#                                  invoking user's browsers
+#   widevine-installer --user      (no root) re-wire the current user's browsers
+#                                  from the already-installed system CDM
+#   widevine-installer --distinstall   packaging mode (static files only)
 
 set -e
 
-# Set to 0 if packaged and the configs are pre-installed
-: ${COPY_CONFIGS=1}
-: ${DESTDIR:=/}
-: ${CONFDIR:=/etc}
-: ${LIBDIR:=/usr/lib64}
-: ${BINDIR:=/usr/bin}
-: ${LIBEXECDIR:=/usr/libexec}
-: ${STATEDIR:=/var/lib}
-: ${ENVIRONMENTDIR:=/usr/lib/environment.d}
-: ${SCRIPT_BASE:=$LIBEXECDIR/widevine-installer}
-: ${INSTALL_BASE:=$STATEDIR/widevine}
-: ${DISTFILES_BASE:=https://commondatastorage.googleapis.com/chromeos-localmirror/distfiles}
-: ${LACROS_NAME:=chromeos-lacros-arm64-squash-zstd}
-: ${LACROS_VERSION:=120.0.6098.0}
-: ${WIDEVINE_VERSION:=4.10.2662.3}
-: ${CHROME_WIDEVINE_BASE:=$LIBDIR/chromium-browser}
-: ${MOZ_PREF_BASE:=$LIBDIR/firefox/defaults/pref}
+# ---- tunables -------------------------------------------------------------
+: "${COPY_CONFIGS:=1}"
+: "${DESTDIR:=/}"
+: "${CONFDIR:=/etc}"
+: "${BINDIR:=/usr/bin}"
+: "${LIBEXECDIR:=/usr/libexec}"
+: "${STATEDIR:=/var/lib}"
+: "${ENVIRONMENTDIR:=/usr/lib/environment.d}"
+: "${SCRIPT_BASE:=$LIBEXECDIR/widevine-installer}"
+: "${INSTALL_BASE:=$STATEDIR/widevine}"
+: "${DISTFILES_BASE:=https://commondatastorage.googleapis.com/chromeos-localmirror/distfiles}"
+: "${LACROS_NAME:=chromeos-lacros-arm64-squash-zstd}"
+: "${LACROS_VERSION:=120.0.6098.0}"
+: "${WIDEVINE_VERSION:=4.10.2662.3}"
 
-[ -e $(dirname "$0")/widevine_fixup.py ] && SCRIPT_BASE="$(realpath "$(dirname "$0")")"
+# Native Firefox default-pref dir varies by distro; first existing parent wins.
+FIREFOX_PREF_DIRS="/usr/lib/firefox/defaults/pref /usr/lib64/firefox/defaults/pref /usr/lib/firefox-esr/defaults/pref"
 
-install_configs() {
-    cd "$SCRIPT_BASE"
-    echo "Copying config files..."
-    install -d -m 0755 "$DESTDIR/$INSTALL_BASE"
-    install -p -m 0644 -t "$DESTDIR/$INSTALL_BASE" ./conf/README
-    install -d -m 0755 "$DESTDIR/$ENVIRONMENTDIR/"
-    install -p -m 0644 ./conf/gmpwidevine.conf "$DESTDIR/$ENVIRONMENTDIR/50-gmpwidevine.conf"
-    install -d -m 0755 "$DESTDIR/$CONFDIR/profile.d/"
-    install -p -m 0644 -t "$DESTDIR/$CONFDIR/profile.d/" ./conf/gmpwidevine.sh
-    install -d -m 0755 "$DESTDIR/$CHROME_WIDEVINE_BASE"
-    ln -sf "$INSTALL_BASE/WidevineCdm" "$DESTDIR/$CHROME_WIDEVINE_BASE/WidevineCdm"
-    install -d -m 0755 "$DESTDIR/$MOZ_PREF_BASE"
-    install -p -m 0644 -t "$DESTDIR/$MOZ_PREF_BASE" ./conf/gmpwidevine.js
+# ~/.config subdirs of Chromium-family browsers that use the component updater.
+CHROMIUM_CONFIG_DIRS="BraveSoftware/Brave-Browser google-chrome google-chrome-beta google-chrome-unstable chromium vivaldi vivaldi-snapshot microsoft-edge opera"
+
+SELF="$(realpath "$0" 2>/dev/null || echo "$0")"
+[ -e "$(dirname "$SELF")/widevine_fixup.py" ] && SCRIPT_BASE="$(dirname "$SELF")"
+
+# ---- helpers --------------------------------------------------------------
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+# Populate a Chromium "system-installed" CDM tree and its component hint.
+#   $1 = path to the browser's WidevineCdm dir
+#   $2 = "symlink" (native, tracks system CDM) or "copy" (confined snaps)
+install_chromium_cdm() {
+    base="$1"; mode="$2"
+    arm="$base/system-installed/_platform_specific/linux_arm64"
+    x64="$base/system-installed/_platform_specific/linux_x64"
+    mkdir -p "$arm" "$x64"
+    # Chromium hardcodes a check for the x64 path; an empty file satisfies it.
+    : > "$x64/libwidevinecdm.so"
+    cp -f "$INSTALL_BASE/manifest.json" "$base/system-installed/manifest.json"
+    if [ "$mode" = symlink ]; then
+        ln -sf "$INSTALL_BASE/libwidevinecdm.so" "$arm/libwidevinecdm.so"
+    else
+        cp -f "$INSTALL_BASE/libwidevinecdm.so" "$arm/libwidevinecdm.so"
+        chmod 0755 "$arm/libwidevinecdm.so"
+    fi
+    if [ "$COPY_CONFIGS" = 1 ]; then
+        printf '{"Path":"%s/system-installed"}\n' "$base" \
+            > "$base/latest-component-updated-widevine-cdm"
+    fi
 }
 
-if [ "$1" = "--distinstall" ]; then
-    install_configs
+# ---- stage 1: system CDM (root) ------------------------------------------
+
+download_and_fixup() {
+    workdir="$(mktemp -d /tmp/widevine-installer.XXXXXXXX)"
+    [ -n "$workdir" ] && [ -d "$workdir" ] || die "could not create work dir"
+    trap 'cd /; rm -rf "$workdir"' EXIT
+    cd "$workdir"
+
+    echo "Downloading LaCrOS (Chrome) image..."
+    url="$DISTFILES_BASE/$LACROS_NAME-$LACROS_VERSION"
+    echo "URL: $url"
+    curl -# -o lacros.squashfs "$url"
+
+    echo; echo "Extracting Widevine..."
+    unsquashfs -q lacros.squashfs 'WidevineCdm/*'
+
+    echo
+    echo "The Widevine license agreement follows:"
+    echo
+    echo ===================================================================================
+    cat squashfs-root/WidevineCdm/LICENSE
+    echo ===================================================================================
+    echo
+    echo "Press enter to proceed, or Ctrl-C to cancel."
+    read dummy
+
+    python3 "$SCRIPT_BASE/widevine_fixup.py" \
+        squashfs-root/WidevineCdm/_platform_specific/cros_arm64/libwidevinecdm.so \
+        libwidevinecdm.so
+}
+
+# Installs the canonical CDM + the symlink layouts consumed by native browsers.
+# Run from the work dir produced by download_and_fixup().
+install_system_cdm() {
+    echo; echo "Installing canonical CDM into $INSTALL_BASE ..."
+    install -d -m 0755 "$INSTALL_BASE"
+    install -p -m 0755 -t "$INSTALL_BASE" libwidevinecdm.so
+    install -p -m 0644 -t "$INSTALL_BASE" squashfs-root/WidevineCdm/manifest.json
+    install -p -m 0644 -t "$INSTALL_BASE" squashfs-root/WidevineCdm/LICENSE
+
+    # Layout for native Firefox (found via MOZ_GMP_PATH).
+    mkdir -p "$INSTALL_BASE/gmp-widevinecdm/system-installed"
+    ln -sf ../../manifest.json     "$INSTALL_BASE/gmp-widevinecdm/system-installed/"
+    ln -sf ../../libwidevinecdm.so "$INSTALL_BASE/gmp-widevinecdm/system-installed/"
+
+    # Generic Chromium WidevineCdm tree (canonical; per-user browsers symlink
+    # their own copies of this below).
+    mkdir -p "$INSTALL_BASE/WidevineCdm/_platform_specific/linux_arm64"
+    mkdir -p "$INSTALL_BASE/WidevineCdm/_platform_specific/linux_x64"
+    : > "$INSTALL_BASE/WidevineCdm/_platform_specific/linux_x64/libwidevinecdm.so"
+    ln -sf ../manifest.json "$INSTALL_BASE/WidevineCdm/"
+    ln -sf ../../../libwidevinecdm.so \
+        "$INSTALL_BASE/WidevineCdm/_platform_specific/linux_arm64/"
+}
+
+# System-wide config for native browsers (env + Firefox default prefs).
+install_system_configs() {
+    [ "$COPY_CONFIGS" = 1 ] || return 0
+    echo "Installing system configuration for native browsers..."
+    [ -f "$SCRIPT_BASE/conf/README" ] && \
+        install -p -m 0644 "$SCRIPT_BASE/conf/README" "$INSTALL_BASE/README"
+    install -d -m 0755 "$ENVIRONMENTDIR"
+    install -p -m 0644 "$SCRIPT_BASE/conf/gmpwidevine.conf" \
+        "$ENVIRONMENTDIR/50-gmpwidevine.conf"
+    install -d -m 0755 "$CONFDIR/profile.d"
+    install -p -m 0644 -t "$CONFDIR/profile.d" "$SCRIPT_BASE/conf/gmpwidevine.sh"
+    for d in $FIREFOX_PREF_DIRS; do
+        if [ -d "$(dirname "$d")" ]; then
+            install -d -m 0755 "$d"
+            install -p -m 0644 "$SCRIPT_BASE/conf/gmpwidevine.js" "$d/gmpwidevine.js"
+            echo "  - native Firefox prefs -> $d/gmpwidevine.js"
+            break
+        fi
+    done
+}
+
+# ---- stage 2/3: per-user browser wiring ----------------------------------
+
+setup_native_chromium() {
+    found=0
+    for sub in $CHROMIUM_CONFIG_DIRS; do
+        cfg="$HOME/.config/$sub"
+        [ -d "$cfg" ] || continue
+        # Skip bare dirs (e.g. created only for NativeMessagingHosts); a browser
+        # that has actually run leaves a "Local State" file or a profile dir.
+        if [ ! -e "$cfg/Local State" ] && [ ! -d "$cfg/Default" ]; then
+            continue
+        fi
+        echo "  - native Chromium: $sub"
+        install_chromium_cdm "$cfg/WidevineCdm" symlink
+        found=1
+    done
+    [ "$found" = 0 ] && echo "  - no native Chromium-family browsers in ~/.config"
+    return 0
+}
+
+setup_snap_chromium() {
+    [ -d "$HOME/snap/chromium" ] || return 0
+    echo "  - snap Chromium"
+    install_chromium_cdm "$HOME/snap/chromium/common/chromium/WidevineCdm" copy
+}
+
+setup_snap_firefox() {
+    [ -d "$HOME/snap/firefox" ] || return 0
+    ini="$HOME/snap/firefox/common/.mozilla/firefox/profiles.ini"
+    [ -f "$ini" ] || return 0
+    # defaults/pref uses pref(); a profile user.js needs user_pref().
+    upref="$(sed 's/^pref(/user_pref(/' "$SCRIPT_BASE/conf/gmpwidevine.js")"
+    for p in $(sed -n 's/^Path=//p' "$ini"); do
+        prof="$HOME/snap/firefox/common/.mozilla/firefox/$p"
+        [ -d "$prof" ] || continue
+        echo "  - snap Firefox profile: $p"
+        gmp="$prof/gmp-widevinecdm/system-installed"
+        install -d -m 0755 "$gmp"
+        install -p -m 0755 "$INSTALL_BASE/libwidevinecdm.so" "$gmp/libwidevinecdm.so"
+        install -p -m 0644 "$INSTALL_BASE/manifest.json" "$gmp/manifest.json"
+        if [ "$COPY_CONFIGS" = 1 ] && \
+           ! grep -q 'media.gmp-widevinecdm.version' "$prof/user.js" 2>/dev/null; then
+            printf '%s\n' "$upref" >> "$prof/user.js"   # idempotent: appended once
+        fi
+    done
+}
+
+user_setup() {
+    [ -e "$INSTALL_BASE/libwidevinecdm.so" ] || \
+        die "system CDM missing at $INSTALL_BASE; run 'sudo $SELF' first."
+    echo "Wiring browsers for user '$(id -un)' (HOME=$HOME)..."
+    setup_native_chromium
+    setup_snap_chromium
+    setup_snap_firefox
+}
+
+run_user_setup_as() {   # $1 = username; re-invokes this script as that user
+    u="$1"
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$u" -- "$SELF" --user
+    elif command -v sudo >/dev/null 2>&1; then
+        h="$(getent passwd "$u" | cut -d: -f6)"
+        sudo -u "$u" HOME="$h" "$SELF" --user
+    else
+        return 1
+    fi
+}
+
+# ---- packaging mode -------------------------------------------------------
+
+distinstall() {
+    install -d -m 0755 "$DESTDIR/$INSTALL_BASE"
+    install -p -m 0644 "$SCRIPT_BASE/conf/README" "$DESTDIR/$INSTALL_BASE/README"
+    install -d -m 0755 "$DESTDIR/$ENVIRONMENTDIR"
+    install -p -m 0644 "$SCRIPT_BASE/conf/gmpwidevine.conf" \
+        "$DESTDIR/$ENVIRONMENTDIR/50-gmpwidevine.conf"
+    install -d -m 0755 "$DESTDIR/$CONFDIR/profile.d"
+    install -p -m 0644 -t "$DESTDIR/$CONFDIR/profile.d" "$SCRIPT_BASE/conf/gmpwidevine.sh"
     install -d -m 0755 "$DESTDIR/$LIBEXECDIR/widevine-installer"
-    install -p -m 0644 -t "$DESTDIR/$LIBEXECDIR/widevine-installer" ./widevine_fixup.py
+    install -p -m 0644 -t "$DESTDIR/$LIBEXECDIR/widevine-installer" \
+        "$SCRIPT_BASE/widevine_fixup.py"
     install -d -m 0755 "$DESTDIR/$BINDIR"
-    install -p -m 0755 -t "$DESTDIR/$BINDIR" ./widevine-installer
-    exit 0
-fi
+    install -p -m 0755 -t "$DESTDIR/$BINDIR" "$SCRIPT_BASE/widevine-installer"
+}
 
-if [ "$(uname -m)" != "aarch64" ]; then
-    echo "This tool is only supported on aarch64 (ARM64) systems."
-    exit 1
-fi
+# ---- main -----------------------------------------------------------------
 
-# if [ "$(whoami)" != "root" ]; then
-#     echo "This tool needs to be run as root."
-#     exit 1
-# fi
+[ "$(uname -m)" = aarch64 ] || die "this tool is only supported on aarch64 (ARM64)."
 
 verchk() {
     (
@@ -63,103 +245,64 @@ verchk() {
         ldd --version | head -1 | cut -d" " -f4
     ) | sort -CV
 }
+verchk || die "glibc too old; Widevine requires glibc 2.36 or newer."
 
-if ! verchk; then
-    echo "Your glibc version is too old. Widevine requires glibc 2.36 or newer."
-    exit 1
+case "$1" in
+    --distinstall) distinstall; exit 0 ;;
+    --user)        user_setup;  echo; echo "Done. Restart your browser(s)."; exit 0 ;;
+    "")            : ;;   # full install, handled below
+    *)             die "unknown option: $1 (use --user or --distinstall)" ;;
+esac
+
+if [ "$(id -u)" != 0 ]; then
+    if [ ! -e "$INSTALL_BASE/libwidevinecdm.so" ]; then
+        echo "The system-wide CDM is not installed yet."
+        echo "Run:  sudo $SELF      (installs $INSTALL_BASE, then wires your browsers)"
+        exit 1
+    fi
+    user_setup
+    echo; echo "Done. Restart your browser(s)."
+    exit 0
 fi
 
-echo "This script will download, adapt, and install a copy of the Widevine"
-echo "Content Decryption Module for aarch64 systems."
-echo
-echo "Widevine is a proprietary DRM technology developed by Google."
-echo "This script uses ARM64 builds intended for ChromeOS images and is"
-echo "not supported nor endorsed by Google. The Asahi Linux community"
-echo "also cannot provide direct support for using this proprietary"
-echo "software, nor any guarantees about its security, quality,"
-echo "functionality, nor privacy. You assume all responsibility for"
-echo "usage of this script and of the installed CDM."
-echo
-echo "This installer will only adapt the binary file format of the CDM"
-echo "for interoperability purposes, to make it function on vanilla"
-echo "ARM64 systems (instead of just ChromeOS). The CDM software"
-echo "itself will not be modified in any way."
-echo
-echo "Widevine version to be installed: $WIDEVINE_VERSION"
+cat <<EOF
+This script will download, adapt, and install a copy of the Widevine
+Content Decryption Module for aarch64 systems.
+
+Widevine is a proprietary DRM technology developed by Google. This script
+uses ARM64 builds intended for ChromeOS images and is not supported nor
+endorsed by Google. The Asahi Linux community also cannot provide direct
+support for using this proprietary software, nor any guarantees about its
+security, quality, functionality, nor privacy. You assume all responsibility
+for usage of this script and of the installed CDM.
+
+This installer only adapts the binary file format of the CDM for
+interoperability on vanilla ARM64 systems; the CDM itself is not modified.
+
+Widevine version to be installed: $WIDEVINE_VERSION
+EOF
 echo
 echo "Press enter to proceed, or Ctrl-C to cancel."
 read dummy
 
-workdir="$(mktemp -d /tmp/widevine-installer.XXXXXXXX)"
-[ -z "$workdir" ] && exit 1 # sanity check
-[ ! -d "$workdir" ] && exit 1 # sanity check
-
-cd "$workdir"
-
-echo "Downloading LaCrOS (Chrome) image..."
-URL="$DISTFILES_BASE/$LACROS_NAME-$LACROS_VERSION"
-echo "URL: $URL"
-curl -# -o lacros.squashfs "$URL"
+download_and_fixup
+install_system_cdm
+install_system_configs
 
 echo
-echo "Extracting Widevine..."
-unsquashfs -q lacros.squashfs 'WidevineCdm/*'
-
-echo
-echo "The Widevine license agreement follows:"
-echo
-echo ===================================================================================
-cat squashfs-root/WidevineCdm/LICENSE
-echo ===================================================================================
-echo
-echo "Press enter to proceed, or Ctrl-C to cancel."
-read dummy
-
-python3 "$SCRIPT_BASE/widevine_fixup.py" squashfs-root/WidevineCdm/_platform_specific/cros_arm64/libwidevinecdm.so libwidevinecdm.so
-
-# snaps store everything in $HOME/snap
-echo "Installing for Firefox..."
-if [ -d "$HOME/snap/firefox" ]; then
-	profiles=$(grep -oP "Path=\K.*" < "$HOME/snap/firefox/common/.mozilla/firefox/profiles.ini")
-	for p in $profiles; do
-		snap_profile_base="$HOME/snap/firefox/common/.mozilla/firefox/$p"
-		install -d -m 0755 "$snap_profile_base/gmp-widevinecdm/system-installed"
-		install -p -m 0755 -t "$snap_profile_base/gmp-widevinecdm/system-installed" libwidevinecdm.so
-		install -p -m 0644 -t "$snap_profile_base/gmp-widevinecdm/system-installed" squashfs-root/WidevineCdm/manifest.json
-
-		if [ "$COPY_CONFIGS" = 1 ]; then
-			cat "$SCRIPT_BASE/conf/gmpwidevine.js" >> "$snap_profile_base/user.js"
-		fi
-	done
+if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ]; then
+    echo "Wiring browsers for $SUDO_USER ..."
+    if ! run_user_setup_as "$SUDO_USER"; then
+        echo "Could not drop privileges; run '$SELF --user' as your normal user."
+    fi
+else
+    echo "System CDM installed. Now run as your normal (non-root) user:"
+    echo "    $SELF --user"
 fi
-
-echo "Installing for Chromium..."
-if [ -d "$HOME/snap/chromium" ]; then
-	# Workaround
-	chrome_base="$HOME/snap/chromium/common/chromium/WidevineCdm/"
-	mkdir -p "$chrome_base/system-installed/_platform_specific/linux_x64"
-	touch "$chrome_base/system-installed/_platform_specific/linux_x64/libwidevinecdm.so"
-
-	mkdir -p "$chrome_base/system-installed/_platform_specific/linux_arm64"
-	install -p -m 0755 -t "$chrome_base/system-installed/_platform_specific/linux_arm64" libwidevinecdm.so
-	install -p -m 0644 -t "$chrome_base/system-installed" \
-	    squashfs-root/WidevineCdm/manifest.json
-
-	if [ "$COPY_CONFIGS" = 1 ]; then
-		cp "$SCRIPT_BASE/conf/latest-component-updated-widevine-cdm" \
-		    "$chrome_base"
-		sed -i "s|USER_HOME|$HOME|" "$chrome_base/latest-component-updated-widevine-cdm"
-	fi
-fi
-
-echo "Cleaning up..."
-cd /
-rm -rf "$workdir"
 
 echo
 echo "Installation complete!"
 if [ "$COPY_CONFIGS" = 1 ]; then
-    echo "You may need to log out and back in for the changes to take effect."
-else
-    echo "Please restart your browser for the changes to take effect."
+    echo "Native Firefox needs a fresh login (for MOZ_GMP_PATH); other browsers"
+    echo "just need a restart."
 fi
